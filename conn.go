@@ -101,11 +101,8 @@ func (e ProtocolError) Error() string {
 	return string(e)
 }
 
-// Connect establishes a connection with a PostgreSQL server using config.
-// config.Host must be specified. config.User will default to the OS user name.
-// Other config fields are optional.
-func Connect(config ConnConfig) (c *Conn, err error) {
-	c = new(Conn)
+func newConn(config ConnConfig) (*Conn, string, string, error) {
+	c := new(Conn)
 
 	c.config = config
 	if c.config.Logger != nil {
@@ -117,7 +114,7 @@ func Connect(config ConnConfig) (c *Conn, err error) {
 	if c.config.User == "" {
 		user, err := user.Current()
 		if err != nil {
-			return nil, err
+			return nil, "", "", err
 		}
 		c.config.User = user.Username
 		c.logger.Debug("Using default connection config", "User", c.config.User)
@@ -141,6 +138,20 @@ func Connect(config ConnConfig) (c *Conn, err error) {
 	}
 	if c.config.Dial == nil {
 		c.config.Dial = (&net.Dialer{KeepAlive: 5 * time.Minute}).Dial
+	}
+
+	return c, network, address, nil
+}
+
+// Connect establishes a connection with a PostgreSQL server using config.
+// config.Host must be specified. config.User will default to the OS user name.
+// Other config fields are optional.
+func Connect(config ConnConfig) (c *Conn, err error) {
+	var network, address string
+	c, network, address, err = newConn(config)
+
+	if err != nil {
+		return nil, err
 	}
 
 	err = c.connect(config, network, address, config.TLSConfig)
@@ -1020,6 +1031,20 @@ func (c *Conn) txStartupMessage(msg *startupMessage) error {
 	return err
 }
 
+func (c *Conn) txCancelMessage(pid, secret int32) error {
+	// no byte1 header on cancel message
+	wbuf := &WriteBuf{buf: append(c.wbuf[0:0], 0, 0, 0, 0), sizeIdx: 0}
+
+	wbuf.WriteInt32(80877102)
+	wbuf.WriteInt32(pid)
+	wbuf.WriteInt32(secret)
+	wbuf.closeMsg()
+
+	_, err := c.conn.Write(wbuf.buf)
+
+	return err
+}
+
 func (c *Conn) txPasswordMessage(password string) (err error) {
 	wbuf := newWriteBuf(c.wbuf[0:0], 'p')
 	wbuf.WriteCString(password)
@@ -1034,4 +1059,42 @@ func (c *Conn) die(err error) {
 	c.alive = false
 	c.causeOfDeath = err
 	c.conn.Close()
+}
+
+func Cancel(cancelConn *Conn) error {
+	c, network, address, err := newConn(cancelConn.config)
+
+	if err != nil {
+		return err
+	}
+
+	c.logger.Info(fmt.Sprintf("Dialing PostgreSQL server at %s address: %s", network, address))
+	c.conn, err = c.config.Dial(network, address)
+	if err != nil {
+		c.logger.Error(fmt.Sprintf("Connection failed: %v", err))
+		return err
+	}
+	defer func() {
+		if c != nil && err != nil {
+			c.conn.Close()
+			c.alive = false
+			c.logger.Error(err.Error())
+		}
+	}()
+
+	c.alive = true
+
+	if c.config.TLSConfig != nil {
+		c.logger.Debug("Starting TLS handshake")
+		if err := c.startTLS(c.config.TLSConfig); err != nil {
+			c.logger.Error(fmt.Sprintf("TLS failed: %v", err))
+			return err
+		}
+	}
+
+	if err := c.txCancelMessage(cancelConn.Pid, cancelConn.SecretKey); err != nil {
+		return err
+	}
+
+	return c.Close()
 }

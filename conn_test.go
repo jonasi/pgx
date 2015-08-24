@@ -936,3 +936,45 @@ func TestInsertTimestampArray(t *testing.T) {
 		t.Errorf("Unexpected results from Exec: %v", results)
 	}
 }
+
+func TestCancel(t *testing.T) {
+	t.Parallel()
+
+	st := time.Now()
+
+	conn := mustConnect(t, *defaultConnConfig)
+	defer closeConn(t, conn)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		_, err := conn.Exec("select pg_sleep_for('5 seconds');")
+
+		if err == nil {
+			t.Fatal("Sleep request finished successfully.  Should have been cancelled")
+		}
+
+		if err.(pgx.PgError).Code != "57014" {
+			t.Fatalf("Unexptected sleep error: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		// "make sure" pg_sleep happens first
+		time.Sleep(50 * time.Millisecond)
+
+		if err := pgx.Cancel(conn); err != nil {
+			t.Fatalf("Unexpected cancel error %v", err)
+		}
+	}()
+
+	wg.Wait()
+
+	if time.Since(st) > 5*time.Second {
+		t.Fatalf("Cancel didn't kill other connection in time: %s", time.Since(st))
+	}
+}
